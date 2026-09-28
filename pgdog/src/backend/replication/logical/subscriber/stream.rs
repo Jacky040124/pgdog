@@ -939,7 +939,7 @@ impl StreamSubscriber {
                         self.table_lsns
                             .insert(oid, finished_transaction.transaction_lsn);
                     }
-                    self.set_current_lsn(finished_transaction.current_lsn);
+                    self.set_committed_lsn(finished_transaction.current_lsn);
 
                     return Ok(true);
                 }
@@ -1020,6 +1020,14 @@ impl StreamSubscriber {
         self.lsn = lsn;
         self.committed_lsn = lsn;
         self.lsn_changed
+    }
+
+    fn set_committed_lsn(&mut self, lsn: i64) {
+        self.committed_lsn = lsn;
+        if lsn > self.lsn {
+            self.lsn_changed = true;
+            self.lsn = lsn;
+        }
     }
 
     /// Advance working LSN only. Used on Begin; does not move the ack pointer.
