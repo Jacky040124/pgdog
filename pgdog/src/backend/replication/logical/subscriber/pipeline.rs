@@ -1,13 +1,12 @@
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use pgdog_postgres_types::Oid;
 use tokio::select;
 use tokio::spawn;
-use tokio::sync::{
-    mpsc::{Receiver, Sender, channel},
-    oneshot,
-};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tracing::trace;
 
 use crate::backend::Server;
@@ -20,6 +19,29 @@ use pgdog_stats::MissedRows;
 
 use super::super::Error;
 
+/// The current state of a transaction that is either:
+/// (1) sent to the shard, but we have not heard back with a RFQ
+/// (2) we've heard back, but it hasn't been confirmed flushed
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TransactionAwaitingCommit {
+    pub(crate) transaction_lsn: i64,
+    pub(crate) current_lsn: i64,
+    pub(crate) changed_tables: HashSet<Oid>,
+    /// Set when we've heard back, and ran the `set_dur_for_any_not_set` stemming from `check_for_committed_transaction`
+    /// After which, we await the `wal_flush_lsn` to advance past, so we know, with certainty, this transaction has flushed.
+    pub(crate) durable_bound: Option<i64>,
+    pub(crate) missed: MissedRows,
+}
+
+/// Every `ROWS_PER_FLUSH` # of INSERTs/etc, we flush the buffer, for them actually to be sent,
+/// so that we can batch that number of operations together, instead of doing them individually.
+///
+/// If it doesn't hit this number beforehand, it's ran when we have a Sync.
+const ROWS_PER_FLUSH: u32 = 100;
+
+/// This represents backpressure (if the Shard can't keep up)
+const COMMAND_CHANNEL_SIZE: usize = 4096;
+
 // State shared between the handle and its background listener task.
 #[derive(Debug, Default)]
 struct Shared {
@@ -27,14 +49,22 @@ struct Shared {
     error: Option<Error>,
     // Rows a direct-to-shard DML expected to touch but didn't (0 rows affected).
     missed: MissedRows,
+
+    /// A queue of not fully flushed transactions.
+    finished_commit: VecDeque<TransactionAwaitingCommit>,
+
+    /// These two fields below are saved state from `refresh_wal_positions` for
+    /// transaction bookkeeping.
+    last_flushed_lsn: i64,
+    last_insert_lsn: i64,
 }
 
 // How a sync point completes.
 enum SyncPointKind {
-    // Wait for `n` ParseComplete responses (in-transaction prepare, `Flush`).
-    ParseAcks(usize),
     // Wait for a single ReadyForQuery (`Sync`: commit, or out-of-transaction prepare).
     ReadyForQuery,
+    // In-transaction prepare (`Flush`), there's nothing to track, no RFQ is sent back
+    Flush,
 }
 
 // One entry per command sent to Postgres, in send order. Popped as acks arrive.
@@ -43,14 +73,9 @@ enum OpSyncPoint {
     DirectDml {
         is_direct: bool,
     },
-    // In-transaction prepare (Flush): resolved after `remaining` ParseComplete ('1') acks.
-    ParseAcks {
-        remaining: usize,
-        done: oneshot::Sender<()>,
-    },
     // Commit or out-of-transaction prepare (Sync): resolved by ReadyForQuery ('Z').
     ReadyForQuery {
-        done: oneshot::Sender<()>,
+        transaction: Option<TransactionAwaitingCommit>,
     },
 }
 
@@ -65,11 +90,7 @@ enum Command {
     SyncPoint {
         messages: Vec<ProtocolMessage>,
         kind: SyncPointKind,
-        done: oneshot::Sender<()>,
-    },
-    // Wait until every outstanding DML ack has been read (no messages sent).
-    DrainAcks {
-        done: oneshot::Sender<()>,
+        transaction: Option<TransactionAwaitingCommit>,
     },
 }
 
@@ -85,7 +106,7 @@ pub(crate) struct PipelinedConnection {
 impl PipelinedConnection {
     /// This moves `server` into a background task and returns a handle to it.
     pub(crate) fn new(server: Server) -> Result<Self, Error> {
-        let (tx, rx) = channel(4096);
+        let (tx, rx) = channel(COMMAND_CHANNEL_SIZE);
         let shared = Arc::new(Mutex::new(Shared::default()));
         let address = server.addr().clone();
 
@@ -94,7 +115,7 @@ impl PipelinedConnection {
             server,
             shared: shared.clone(),
             queue: VecDeque::new(),
-            drain_waiter: None,
+            flushed: 0,
         };
 
         spawn(listener.run());
@@ -109,6 +130,17 @@ impl PipelinedConnection {
     /// Server address.
     pub(crate) fn addr(&self) -> &Address {
         &self.address
+    }
+
+    pub(crate) fn get_flushed_and_insert(&self) -> (i64, i64) {
+        let lock = self.shared.lock();
+        (lock.last_flushed_lsn, lock.last_insert_lsn)
+    }
+
+    pub(crate) fn set_wal_positions(&self, insert_lsn: i64, flush_lsn: i64) {
+        let mut lock = self.shared.lock();
+        lock.last_insert_lsn = insert_lsn;
+        lock.last_flushed_lsn = flush_lsn;
     }
 
     /// Enqueue a DML statement (`Bind/Execute/Flush`) without waiting for its
@@ -134,36 +166,48 @@ impl PipelinedConnection {
         }
         let mut messages: Vec<ProtocolMessage> = parses.iter().map(|p| p.clone().into()).collect();
         let kind = if in_transaction {
-            // If in transaction we send flush and wait for the acknowledgements
-            // since we donot want to commit the open transaction.
             messages.push(Flush.into());
-            SyncPointKind::ParseAcks(parses.len())
+            SyncPointKind::Flush
         } else {
-            // Since we are not in a transaction we send Sync and wait for postgres
-            // to becomes ready for the next command.
             messages.push(Sync.into());
             SyncPointKind::ReadyForQuery
         };
-        self.send_command_and_wait_for_sync_point(messages, kind)
-            .await
+        self.send_command_and_dont_wait(messages, kind, None).await
     }
 
     /// Send `Sync` and wait for `ReadyForQuery` (commits the open implicit
     /// transaction on this shard).
-    pub(crate) async fn sync_and_drain(&self) -> Result<(), Error> {
-        self.send_command_and_wait_for_sync_point(vec![Sync.into()], SyncPointKind::ReadyForQuery)
-            .await
+    pub(crate) async fn sync_and_dont_drain(
+        &self,
+        transaction: Option<TransactionAwaitingCommit>,
+    ) -> Result<(), Error> {
+        self.send_command_and_dont_wait(
+            vec![Sync.into()],
+            SyncPointKind::ReadyForQuery,
+            transaction,
+        )
+        .await
     }
 
-    /// Wait until every outstanding DML acknowledgment has been read. Used at
-    /// commit to confirm the shard is error-free before any shard is `Sync`ed.
-    pub(crate) async fn drain_acks(&self) -> Result<(), Error> {
-        let (done, rx) = oneshot::channel();
-        self.tx
-            .send(Command::DrainAcks { done })
-            .await
-            .map_err(|_| Error::PipelineClosed)?;
-        self.resolve_sync_point(rx).await
+    pub(crate) fn peek_front_finished(&self) -> Option<(i64, Option<i64>)> {
+        self.shared
+            .lock()
+            .finished_commit
+            .front()
+            .map(|trans| (trans.current_lsn, trans.durable_bound))
+    }
+
+    pub(crate) fn set_dur_for_any_not_set(&self, dur: i64) {
+        let mut lock = self.shared.lock();
+        for x in &mut lock.finished_commit {
+            if x.durable_bound.is_none() {
+                x.durable_bound = Some(dur);
+            }
+        }
+    }
+
+    pub(crate) fn pop_from_front_finished(&self) -> Option<TransactionAwaitingCommit> {
+        self.shared.lock().finished_commit.pop_front()
     }
 
     /// Non-blocking peek + take of the latched error. `Some` means the shard
@@ -173,33 +217,21 @@ impl PipelinedConnection {
     }
 
     /// Drain the missed-row counters accumulated by the listener.
-    pub(crate) fn take_missed_rows(&self) -> MissedRows {
-        std::mem::take(&mut self.shared.lock().missed)
-    }
-
     // This function send the prepared command along with the type of sync point we are waiting for.
-    async fn send_command_and_wait_for_sync_point(
+    async fn send_command_and_dont_wait(
         &self,
         messages: Vec<ProtocolMessage>,
         kind: SyncPointKind,
+        transaction: Option<TransactionAwaitingCommit>,
     ) -> Result<(), Error> {
-        let (done, rx) = oneshot::channel();
         self.tx
             .send(Command::SyncPoint {
                 messages,
                 kind,
-                done,
+                transaction,
             })
             .await
-            .map_err(|_| Error::PipelineClosed)?;
-        self.resolve_sync_point(rx).await
-    }
-
-    // Resolve a sync point (signaled by the listener task).
-    // If the task died before signaling, surface the latched error.
-    async fn resolve_sync_point(&self, rx: oneshot::Receiver<()>) -> Result<(), Error> {
-        rx.await
-            .map_err(|_| self.take_error().unwrap_or(Error::PipelineClosed))
+            .map_err(|_| Error::PipelineClosed)
     }
 }
 
@@ -210,9 +242,7 @@ struct Listener {
     server: Server,
     shared: Arc<Mutex<Shared>>,
     queue: VecDeque<OpSyncPoint>,
-    // Waiter that resolves once every DML ack has been read. At most one is
-    // outstanding: `commit()` issues drain_acks sequentially, one per connection.
-    drain_waiter: Option<oneshot::Sender<()>>,
+    flushed: u32,
 }
 
 impl Listener {
@@ -272,35 +302,21 @@ impl Listener {
             Command::SyncPoint {
                 messages,
                 kind,
-                done,
+                transaction,
             } => {
                 if let Err(err) = self.write(&messages).await {
                     self.latch_error(err);
-                    // Drop the sender (do not send): rx errors, so resolve_sync_point
-                    // surfaces the latched error instead of a false Ok.
-                    drop(done);
                     self.wake_all();
                     return Err(Error::PipelineClosed);
                 }
+                self.flushed = 0;
+
                 match kind {
-                    SyncPointKind::ParseAcks(remaining) => {
-                        self.queue
-                            .push_back(OpSyncPoint::ParseAcks { remaining, done });
-                    }
                     SyncPointKind::ReadyForQuery => {
-                        self.queue.push_back(OpSyncPoint::ReadyForQuery { done });
+                        self.queue
+                            .push_back(OpSyncPoint::ReadyForQuery { transaction });
                     }
-                }
-            }
-            Command::DrainAcks { done } => {
-                let has_dml = self
-                    .queue
-                    .iter()
-                    .any(|op| matches!(op, OpSyncPoint::DirectDml { .. }));
-                if !has_dml {
-                    let _ = done.send(());
-                } else {
-                    self.drain_waiter = Some(done);
+                    SyncPointKind::Flush => {}
                 }
             }
         }
@@ -322,22 +338,6 @@ impl Listener {
                 // resolve every waiter so the handle can roll back.
                 self.wake_all();
             }
-            // ParseComplete: decrement the front ParseSync counter; resolve when it hits 0.
-            '1' => {
-                let resolved = if let Some(OpSyncPoint::ParseAcks { remaining, .. }) =
-                    self.queue.front_mut()
-                {
-                    *remaining -= 1;
-                    *remaining == 0
-                } else {
-                    false
-                };
-                if resolved
-                    && let Some(OpSyncPoint::ParseAcks { done, .. }) = self.queue.pop_front()
-                {
-                    let _ = done.send(());
-                }
-            }
             // BindComplete: nothing to account for.
             '2' => {}
             // CommandComplete: match to the DML op and count missed rows.
@@ -358,18 +358,16 @@ impl Listener {
                         _ => (),
                     }
                 }
-                if !self
-                    .queue
-                    .iter()
-                    .any(|op| matches!(op, OpSyncPoint::DirectDml { .. }))
-                {
-                    self.wake_drain();
-                }
             }
             // ReadyForQuery: resolve the front ReadySync waiter.
             'Z' => {
-                if let Some(OpSyncPoint::ReadyForQuery { done }) = self.queue.pop_front() {
-                    let _ = done.send(());
+                // "sync point for transaction N resolved"
+                if let Some(OpSyncPoint::ReadyForQuery { transaction }) = self.queue.pop_front()
+                    && let Some(mut waiting_transaction) = transaction
+                {
+                    let mut shared = self.shared.lock();
+                    waiting_transaction.missed = std::mem::take(&mut shared.missed);
+                    shared.finished_commit.push_back(waiting_transaction);
                 }
             }
             // NoticeResponse / ParameterStatus / NotificationResponse / etc.
@@ -383,8 +381,19 @@ impl Listener {
         let bind: ProtocolMessage = bind.into();
         self.server.send_one(&bind).await?;
         self.server.send_one(&Execute::new().into()).await?;
+
+        self.flushed += 1;
+        if self.flushed == ROWS_PER_FLUSH {
+            self.flushed = 0;
+            self.send_flush_and_flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn send_flush_and_flush(&mut self) -> Result<(), Error> {
         self.server.send_one(&Flush.into()).await?;
         self.server.flush().await?;
+
         Ok(())
     }
 
@@ -405,13 +414,6 @@ impl Listener {
 
     fn wake_all(&mut self) {
         self.queue.clear();
-        drop(self.drain_waiter.take());
-    }
-
-    fn wake_drain(&mut self) {
-        if let Some(done) = self.drain_waiter.take() {
-            let _ = done.send(());
-        }
     }
 
     fn address(&self) -> &Address {
@@ -426,6 +428,43 @@ mod test {
         backend::server::test::test_server,
         net::{Parse, messages::bind::Parameter},
     };
+    use std::time::{Duration, Instant};
+    use tokio::time::sleep;
+
+    async fn commit_and_wait(
+        conn: &PipelinedConnection,
+        lsn: i64,
+    ) -> Option<TransactionAwaitingCommit> {
+        conn.sync_and_dont_drain(Some(TransactionAwaitingCommit {
+            transaction_lsn: lsn,
+            current_lsn: lsn,
+            changed_tables: HashSet::new(),
+            durable_bound: None,
+            missed: MissedRows::default(),
+        }))
+        .await
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if conn.peek_front_finished().map(|(front, _)| front) == Some(lsn) {
+                return conn.pop_from_front_finished();
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    async fn wait_for_error(conn: &PipelinedConnection) -> Option<Error> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(err) = conn.take_error() {
+                return Some(err);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
 
     #[tokio::test]
     async fn prepare_execute_drain_commit() {
@@ -463,9 +502,8 @@ mod test {
         .await
         .unwrap();
 
-        // Drain the outstanding DML ack, then commit.
-        conn.drain_acks().await.unwrap();
-        conn.sync_and_drain().await.unwrap();
+        let committed = commit_and_wait(&conn, 1).await;
+        assert!(committed.is_some());
         assert!(conn.take_error().is_none());
     }
 
@@ -474,20 +512,18 @@ mod test {
         let server = test_server().await;
         let conn = PipelinedConnection::new(server).unwrap();
 
-        // In-transaction prepare sends Flush and waits for ParseComplete acks
-        // (ParseAcks path) rather than committing with Sync.
         conn.prepare(&[Parse::named("__pipe_flush", "SELECT $1::bigint")], true)
             .await
             .unwrap();
 
-        // Execute against the just-prepared statement, then commit.
         conn.execute(
             Bind::new_params("__pipe_flush", &[Parameter::new(b"42")]),
             false,
         )
         .await
         .unwrap();
-        conn.sync_and_drain().await.unwrap();
+        let committed = commit_and_wait(&conn, 1).await;
+        assert!(committed.is_some());
         assert!(conn.take_error().is_none());
     }
 
@@ -496,17 +532,14 @@ mod test {
         let server = test_server().await;
         let conn = PipelinedConnection::new(server).unwrap();
 
-        // Out-of-transaction prepare of invalid SQL: Postgres replies with an
-        // ErrorResponse, which is latched and surfaced through the Sync path.
-        let err = conn
-            .prepare(&[Parse::named("__pipe_bad", "NOT VALID SQL")], false)
+        conn.prepare(&[Parse::named("__pipe_bad", "NOT VALID SQL")], false)
             .await
-            .unwrap_err();
+            .unwrap();
+        let err = wait_for_error(&conn).await.unwrap();
         assert!(
             matches!(err, Error::PgError(_)),
             "unexpected error: {err:?}"
         );
-        // The error was taken while surfacing, so nothing remains latched.
         assert!(conn.take_error().is_none());
     }
 
@@ -515,13 +548,10 @@ mod test {
         let server = test_server().await;
         let conn = PipelinedConnection::new(server).unwrap();
 
-        // In-transaction prepare uses Flush, so Postgres sends no ReadyForQuery
-        // on error. The parked ParseAcks waiter can only be released by the
-        // 'E' handler's wake_all(): this proves the prepare does not hang.
-        let err = conn
-            .prepare(&[Parse::named("__pipe_bad", "NOT VALID SQL")], true)
+        conn.prepare(&[Parse::named("__pipe_bad", "NOT VALID SQL")], true)
             .await
-            .unwrap_err();
+            .unwrap();
+        let err = wait_for_error(&conn).await.unwrap();
         assert!(
             matches!(err, Error::PgError(_)),
             "unexpected error: {err:?}"
@@ -531,7 +561,6 @@ mod test {
 
     #[tokio::test]
     async fn execute_runtime_error_latches_and_does_not_block() {
-        use std::time::Duration;
         use tokio::time::timeout;
 
         let server = test_server().await;
@@ -550,23 +579,13 @@ mod test {
         .await
         .unwrap();
 
-        // Barrier that observes the error. Two benign races:
-        //  - sync point queued before 'E': wake_all drops its `done`, the sync
-        //    resolves as Err(PgError).
-        //  - 'E' latched first: the sync hits the `errored` branch and returns
-        //    Ok, leaving the error latched.
-        // Either way the error is observable; it is never lost.
-        let barrier = conn.sync_and_drain().await;
+        conn.sync_and_dont_drain(None).await.unwrap();
+        let err = wait_for_error(&conn).await.unwrap();
         assert!(
-            barrier.is_err() || conn.take_error().is_some(),
-            "error was neither surfaced nor latched: {barrier:?}"
+            matches!(err, Error::PgError(_)),
+            "unexpected error: {err:?}"
         );
 
-        // Future calls must not block. Depending on the race the connection is
-        // either still errored (commands short-circuit) or already recovered by
-        // the barrier's Sync (commands run again); either way each call must
-        // resolve promptly. A hang (queue never drained, `done` never resolved)
-        // would elapse the timeout. The Ok/Err of each call is irrelevant here.
         for _ in 0..3 {
             let _ = timeout(
                 Duration::from_secs(5),
@@ -578,16 +597,13 @@ mod test {
             .await
             .expect("execute blocked after error");
         }
-        let _ = timeout(Duration::from_secs(5), conn.sync_and_drain())
+        let _ = timeout(Duration::from_secs(5), conn.sync_and_dont_drain(None))
             .await
-            .expect("sync_and_drain blocked after error");
+            .expect("sync blocked after error");
     }
 
     #[tokio::test]
-    async fn errored_connection_drain_acks_returns_error() {
-        use std::time::Duration;
-        use tokio::time::sleep;
-
+    async fn errored_connection_never_completes_commit() {
         let server = test_server().await;
         let conn = PipelinedConnection::new(server).unwrap();
 
@@ -602,18 +618,23 @@ mod test {
         .await
         .unwrap();
 
-        // Let the listener read the ErrorResponse and latch it, so the following
-        // drain_acks hits the `errored` branch (the path that used to send `done`
-        // and return a false Ok, swallowing the error at commit time).
-        sleep(Duration::from_millis(300)).await;
-
-        // drain_acks must surface the latched error, not report a clean drain.
-        // This mirrors commit()'s phase 1 `?`, which aborts before any Sync.
-        let err = conn.drain_acks().await.unwrap_err();
+        conn.sync_and_dont_drain(Some(TransactionAwaitingCommit {
+            transaction_lsn: 1,
+            current_lsn: 1,
+            changed_tables: HashSet::new(),
+            durable_bound: None,
+            missed: MissedRows::default(),
+        }))
+        .await
+        .unwrap();
+        let err = wait_for_error(&conn).await.unwrap();
         assert!(
             matches!(err, Error::PgError(_)),
             "unexpected error: {err:?}"
         );
+        sleep(Duration::from_millis(300)).await;
+        let finished = conn.peek_front_finished();
+        assert!(finished.is_none());
     }
 
     #[tokio::test]
@@ -698,13 +719,11 @@ mod test {
         .await
         .unwrap();
 
-        // Drain acks so every 'C' (and thus every record()) is processed before
-        // we read the stats, then commit.
-        conn.drain_acks().await.unwrap();
-        conn.sync_and_drain().await.unwrap();
+        let committed = commit_and_wait(&conn, 1).await;
+        assert!(committed.is_some());
         assert!(conn.take_error().is_none());
 
-        let missed = conn.take_missed_rows();
+        let missed = committed.unwrap().missed;
         // (insert, update, delete): one 0-row direct UPDATE and one 0-row direct
         // DELETE counted; the non-direct DELETE and the 1-row DELETE are not.
         // Insert never missed here, so it must stay 0 (no spurious counter).
